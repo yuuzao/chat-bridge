@@ -1,9 +1,9 @@
-# 镜像由本机构建，标签是完整 Git commit。
-# 本机没有镜像仓库。pull_policy 设为 never，启动时不会去 Docker Hub 拉取这个本地标签。
+# 镜像由推送到 master 的 GitHub Actions 发布到 GHCR。
+# 标签是那次提交的完整 Git commit，启动时总是拉取这个标签。
 services:
   chat-bridge:
-    image: chat-bridge:${GIT_COMMIT:?GIT_COMMIT is required}
-    pull_policy: never
+    image: ghcr.io/yuuzao/chat-bridge:${GIT_COMMIT:?GIT_COMMIT is required}
+    pull_policy: always
     user: "${HOST_UID:?HOST_UID is required}:${HOST_GID:?HOST_GID is required}"
     environment:
       LOG_LEVEL: INFO
