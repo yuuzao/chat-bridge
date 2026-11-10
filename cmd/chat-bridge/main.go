@@ -50,7 +50,7 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 		return err
 	}
 	store := taskstore.New()
-	fwd, err := forward.New(cfg.BotURL, cfg.AuthToken, cfg.ForwardTimeout, cfg.MaxBodyBytes, logger)
+	fwd, err := forward.New(cfg.BotURL, cfg.BotBearerToken, cfg.ForwardTimeout, cfg.MaxBodyBytes, logger)
 	if err != nil {
 		return err
 	}

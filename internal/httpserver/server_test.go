@@ -32,7 +32,7 @@ func TestJSONTaskAndTextWebhook(t *testing.T) {
 		t.Fatalf("created = %+v", created)
 	}
 	forwarded := h.awaitBot(t)
-	if forwarded.token != h.token || !strings.Contains(forwarded.contentType, "application/json") {
+	if forwarded.token != "Bearer "+h.bearer || !strings.Contains(forwarded.contentType, "application/json") {
 		t.Fatalf("forward = %+v", forwarded)
 	}
 	var sent struct {
@@ -427,6 +427,7 @@ type capture struct {
 
 type harness struct {
 	token    string
+	bearer   string
 	logs     *lockedBuffer
 	captured chan capture
 	api      *httptest.Server
@@ -446,6 +447,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 	h := &harness{
 		token:    "test-token",
+		bearer:   "bot-bearer",
 		logs:     &lockedBuffer{},
 		captured: make(chan capture, 8),
 		client:   &http.Client{},
@@ -456,7 +458,10 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 			t.Errorf("read bot body: %v", err)
 			return
 		}
-		h.captured <- capture{token: r.Header.Get("X-Auth-Token"), contentType: r.Header.Get("Content-Type"), body: body}
+		if r.Header.Get("X-Auth-Token") != "" {
+			t.Errorf("bridge token was sent")
+		}
+		h.captured <- capture{token: r.Header.Get("Authorization"), contentType: r.Header.Get("Content-Type"), body: body}
 		if opts.bot != nil {
 			opts.bot(w, r)
 			return
@@ -469,12 +474,13 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		ListenAddr:      "127.0.0.1:0",
 		AuthToken:       h.token,
 		BotURL:          bot.URL,
+		BotBearerToken:  h.bearer,
 		MaxBodyBytes:    opts.maxBody,
 		TaskTTL:         time.Minute,
 		ForwardTimeout:  opts.forwardTimeout,
 		CleanupInterval: time.Minute,
 	}
-	fwd, err := forward.New(cfg.BotURL, cfg.AuthToken, cfg.ForwardTimeout, cfg.MaxBodyBytes, logger)
+	fwd, err := forward.New(cfg.BotURL, cfg.BotBearerToken, cfg.ForwardTimeout, cfg.MaxBodyBytes, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

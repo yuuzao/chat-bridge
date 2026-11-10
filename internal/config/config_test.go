@@ -14,7 +14,7 @@ func TestLoadAcceptsCompleteFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ListenAddr != "127.0.0.1:8080" || cfg.AuthToken != "secret" || cfg.BotURL != "http://127.0.0.1:9/bot?x=1" {
+	if cfg.ListenAddr != "127.0.0.1:8080" || cfg.AuthToken != "secret" || cfg.BotURL != "http://127.0.0.1:9/bot?x=1" || cfg.BotBearerToken != "bot-secret" {
 		t.Fatalf("config = %+v", cfg)
 	}
 	if cfg.MaxBodyBytes != 1024 || cfg.TaskTTL != 10*time.Second || cfg.ForwardTimeout != 5*time.Second || cfg.CleanupInterval != 2*time.Second {
@@ -31,6 +31,8 @@ func TestLoadRejectsInvalidFiles(t *testing.T) {
 	}{
 		{name: "missing listen", yaml: strings.Replace(validYAML(), "listen_addr: \"127.0.0.1:8080\"\n", "", 1), wantErr: "listen_addr"},
 		{name: "empty token", yaml: strings.Replace(validYAML(), "auth_token: \"secret\"", "auth_token: \"\"", 1), wantErr: "auth_token"},
+		{name: "empty bearer", yaml: strings.Replace(validYAML(), "bot_bearer_token: \"bot-secret\"", "bot_bearer_token: \"\"", 1), wantErr: "bot_bearer_token"},
+		{name: "bearer whitespace", yaml: strings.Replace(validYAML(), "bot_bearer_token: \"bot-secret\"", "bot_bearer_token: \"bot secret\"", 1), wantErr: "bot_bearer_token"},
 		{name: "zero body", yaml: strings.Replace(validYAML(), "max_body_bytes: 1024", "max_body_bytes: 0", 1), wantErr: "max_body_bytes"},
 		{name: "negative ttl", yaml: strings.Replace(validYAML(), "task_ttl_seconds: 10", "task_ttl_seconds: -1", 1), wantErr: "task_ttl_seconds"},
 		{name: "unknown field", yaml: validYAML() + "extra: 1\n", wantErr: "extra"},
@@ -63,6 +65,7 @@ func validYAML() string {
 	return `listen_addr: "127.0.0.1:8080"
 auth_token: "secret"
 bot_url: "http://127.0.0.1:9/bot?x=1"
+bot_bearer_token: "bot-secret"
 max_body_bytes: 1024
 task_ttl_seconds: 10
 forward_timeout_seconds: 5

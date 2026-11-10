@@ -20,8 +20,11 @@ func TestSendDoesNotFollowRedirect(t *testing.T) {
 	}))
 	t.Cleanup(secret.Close)
 	bot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Auth-Token") != "secret" {
-			t.Errorf("token = %q", r.Header.Get("X-Auth-Token"))
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("X-Auth-Token") != "" {
+			t.Errorf("bridge token was sent")
 		}
 		http.Redirect(w, r, secret.URL, http.StatusFound)
 	}))

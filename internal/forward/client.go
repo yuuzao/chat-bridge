@@ -42,12 +42,13 @@ type Client struct {
 }
 
 // New 创建转发客户端。timeout 是整次请求的超时。重定向不会被跟随。
-func New(botURL, token string, timeout time.Duration, maxDrain int64, logger *slog.Logger) (*Client, error) {
+// bearerToken 是 Bot 要求的密钥，请求头写成 Authorization: Bearer <bearerToken>。
+func New(botURL, bearerToken string, timeout time.Duration, maxDrain int64, logger *slog.Logger) (*Client, error) {
 	if _, err := validateBotURL(botURL); err != nil {
 		return nil, err
 	}
-	if token == "" {
-		return nil, errors.New("auth token is required")
+	if bearerToken == "" {
+		return nil, errors.New("bot bearer token is required")
 	}
 	if timeout <= 0 {
 		return nil, errors.New("forward timeout must be positive")
@@ -60,7 +61,7 @@ func New(botURL, token string, timeout time.Duration, maxDrain int64, logger *sl
 	}
 	return &Client{
 		url:      botURL,
-		token:    token,
+		token:    bearerToken,
 		maxDrain: maxDrain,
 		log:      logger,
 		http: &http.Client{
@@ -120,7 +121,7 @@ func (c *Client) newRequest(ctx context.Context, msg Message) (*http.Request, er
 		return nil, fmt.Errorf("build bot request: %w", err)
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("X-Auth-Token", c.token)
+	req.Header.Set("Authorization", "Bearer "+c.token)
 	return req, nil
 }
 

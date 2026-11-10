@@ -20,6 +20,7 @@ type Config struct {
 	ListenAddr      string
 	AuthToken       string
 	BotURL          string
+	BotBearerToken  string
 	MaxBodyBytes    int64
 	TaskTTL         time.Duration
 	ForwardTimeout  time.Duration
@@ -30,6 +31,7 @@ type fileConfig struct {
 	ListenAddr             string `yaml:"listen_addr"`
 	AuthToken              string `yaml:"auth_token"`
 	BotURL                 string `yaml:"bot_url"`
+	BotBearerToken         string `yaml:"bot_bearer_token"`
 	MaxBodyBytes           int64  `yaml:"max_body_bytes"`
 	TaskTTLSeconds         int64  `yaml:"task_ttl_seconds"`
 	ForwardTimeoutSeconds  int64  `yaml:"forward_timeout_seconds"`
@@ -75,6 +77,10 @@ func (raw fileConfig) config() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	bearer, err := parseBotBearer(raw.BotBearerToken)
+	if err != nil {
+		return Config{}, err
+	}
 	if raw.MaxBodyBytes <= 0 {
 		return Config{}, errors.New("max_body_bytes must be a positive integer")
 	}
@@ -94,6 +100,7 @@ func (raw fileConfig) config() (Config, error) {
 		ListenAddr:      raw.ListenAddr,
 		AuthToken:       raw.AuthToken,
 		BotURL:          botURL,
+		BotBearerToken:  bearer,
 		MaxBodyBytes:    raw.MaxBodyBytes,
 		TaskTTL:         ttl,
 		ForwardTimeout:  forwardTimeout,
@@ -123,6 +130,16 @@ func parseBotURL(raw string) (string, error) {
 	}
 	if parsed.Fragment != "" {
 		return "", errors.New("bot_url must not contain a fragment")
+	}
+	return raw, nil
+}
+
+func parseBotBearer(raw string) (string, error) {
+	if raw == "" {
+		return "", errors.New("bot_bearer_token is required")
+	}
+	if strings.TrimSpace(raw) != raw || strings.ContainsAny(raw, " \t\r\n") {
+		return "", errors.New("bot_bearer_token must not contain whitespace")
 	}
 	return raw, nil
 }

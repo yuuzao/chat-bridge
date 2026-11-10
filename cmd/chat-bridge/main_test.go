@@ -91,6 +91,7 @@ func writeConfig(t *testing.T) string {
 	content := []byte(`listen_addr: "127.0.0.1:0"
 auth_token: "secret"
 bot_url: "http://127.0.0.1:9/bot"
+bot_bearer_token: "bot-secret"
 max_body_bytes: 1024
 task_ttl_seconds: 10
 forward_timeout_seconds: 5
