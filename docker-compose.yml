@@ -1,0 +1,18 @@
+# 镜像由本机构建，标签是完整 Git commit。
+# 本机没有镜像仓库。pull_policy 设为 never，启动时不会去 Docker Hub 拉取这个本地标签。
+services:
+  chat-bridge:
+    image: chat-bridge:${GIT_COMMIT:?GIT_COMMIT is required}
+    pull_policy: never
+    user: "${HOST_UID:?HOST_UID is required}:${HOST_GID:?HOST_GID is required}"
+    environment:
+      LOG_LEVEL: INFO
+      GIT_COMMIT: ${GIT_COMMIT:?GIT_COMMIT is required}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    restart: "no"
