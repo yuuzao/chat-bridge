@@ -205,9 +205,18 @@ func TestForwardFailureIsReadableRepeatedly(t *testing.T) {
 	h := newHarness(t, harnessOptions{botStatus: http.StatusInternalServerError})
 	created := h.create(t, `{"content":"hi"}`)
 	h.awaitBot(t)
+	var body statusResponse
+	for i := 0; i < 100; i++ {
+		statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+		body = decodeJSON[statusResponse](t, statusResp)
+		if statusResp.StatusCode == http.StatusOK && body.Status != taskstore.StatusPending {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	for i := 0; i < 2; i++ {
 		statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
-		body := decodeJSON[statusResponse](t, statusResp)
+		body = decodeJSON[statusResponse](t, statusResp)
 		if statusResp.StatusCode != http.StatusOK || body.Status != taskstore.StatusFailed || !strings.Contains(body.Error, "HTTP 500") {
 			t.Fatalf("status %d = %d %+v", i, statusResp.StatusCode, body)
 		}
