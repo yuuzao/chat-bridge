@@ -12,6 +12,9 @@ services:
       - "8080:8080"
     volumes:
       - ./config.yaml:/config.yaml:ro
+      # SQLite 数据库目录。必须挂目录而不是单个文件，WAL 日志要在同一目录里创建。
+      # config.yaml 里的 db_path 对应 /data/chat-bridge.db。
+      - ./data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     read_only: true

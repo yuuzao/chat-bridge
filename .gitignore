@@ -2,3 +2,7 @@
 /chat-bridge.exe
 /config.yaml
 /coverage.out
+/data/
+*.db
+*.db-wal
+*.db-shm

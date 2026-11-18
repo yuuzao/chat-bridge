@@ -17,25 +17,23 @@ import (
 
 // Config 是启动时已经校验过的配置。时长字段由秒数换算而来。
 type Config struct {
-	ListenAddr      string
-	AuthToken       string
-	BotURL          string
-	BotBearerToken  string
-	MaxBodyBytes    int64
-	TaskTTL         time.Duration
-	ForwardTimeout  time.Duration
-	CleanupInterval time.Duration
+	ListenAddr     string
+	AuthToken      string
+	BotURL         string
+	BotBearerToken string
+	MaxBodyBytes   int64
+	DBPath         string
+	ForwardTimeout time.Duration
 }
 
 type fileConfig struct {
-	ListenAddr             string `yaml:"listen_addr"`
-	AuthToken              string `yaml:"auth_token"`
-	BotURL                 string `yaml:"bot_url"`
-	BotBearerToken         string `yaml:"bot_bearer_token"`
-	MaxBodyBytes           int64  `yaml:"max_body_bytes"`
-	TaskTTLSeconds         int64  `yaml:"task_ttl_seconds"`
-	ForwardTimeoutSeconds  int64  `yaml:"forward_timeout_seconds"`
-	CleanupIntervalSeconds int64  `yaml:"cleanup_interval_seconds"`
+	ListenAddr            string `yaml:"listen_addr"`
+	AuthToken             string `yaml:"auth_token"`
+	BotURL                string `yaml:"bot_url"`
+	BotBearerToken        string `yaml:"bot_bearer_token"`
+	MaxBodyBytes          int64  `yaml:"max_body_bytes"`
+	DBPath                string `yaml:"db_path"`
+	ForwardTimeoutSeconds int64  `yaml:"forward_timeout_seconds"`
 }
 
 // Load 读取 path 指向的 YAML。缺字段、未知字段、重复字段或非法取值都会返回错误。
@@ -84,27 +82,21 @@ func (raw fileConfig) config() (Config, error) {
 	if raw.MaxBodyBytes <= 0 {
 		return Config{}, errors.New("max_body_bytes must be a positive integer")
 	}
-	ttl, err := positiveSeconds("task_ttl_seconds", raw.TaskTTLSeconds)
-	if err != nil {
-		return Config{}, err
+	if raw.DBPath == "" {
+		return Config{}, errors.New("db_path is required")
 	}
 	forwardTimeout, err := positiveSeconds("forward_timeout_seconds", raw.ForwardTimeoutSeconds)
 	if err != nil {
 		return Config{}, err
 	}
-	cleanupInterval, err := positiveSeconds("cleanup_interval_seconds", raw.CleanupIntervalSeconds)
-	if err != nil {
-		return Config{}, err
-	}
 	return Config{
-		ListenAddr:      raw.ListenAddr,
-		AuthToken:       raw.AuthToken,
-		BotURL:          botURL,
-		BotBearerToken:  bearer,
-		MaxBodyBytes:    raw.MaxBodyBytes,
-		TaskTTL:         ttl,
-		ForwardTimeout:  forwardTimeout,
-		CleanupInterval: cleanupInterval,
+		ListenAddr:     raw.ListenAddr,
+		AuthToken:      raw.AuthToken,
+		BotURL:         botURL,
+		BotBearerToken: bearer,
+		MaxBodyBytes:   raw.MaxBodyBytes,
+		DBPath:         raw.DBPath,
+		ForwardTimeout: forwardTimeout,
 	}, nil
 }
 

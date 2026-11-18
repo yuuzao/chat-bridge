@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"chat_bridge/internal/taskstore"
 )
 
 func TestRunRequiresConfigFlag(t *testing.T) {
@@ -27,7 +29,7 @@ func TestRunRejectsExtraArgsAndBadLogLevel(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	path := writeConfig(t)
+	path, _ := writeConfig(t)
 	err := run(ctx, []string{"-config", path, "extra"}, func(string) string { return "" })
 	if err == nil || !strings.Contains(err.Error(), "unexpected") {
 		t.Fatal(err)
@@ -39,6 +41,49 @@ func TestRunRejectsExtraArgsAndBadLogLevel(t *testing.T) {
 		return ""
 	})
 	if err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {
+		t.Fatal(err)
+	}
+}
+
+func TestRunOpensAndClosesStore(t *testing.T) {
+	t.Parallel()
+	configPath, dbPath := writeConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"-config", configPath}, func(key string) string {
+			if key == "LOG_LEVEL" {
+				return "ERROR"
+			}
+			return ""
+		})
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(dbPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("sqlite database was not created")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not stop")
+	}
+	store, err := taskstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen database after shutdown: %v", err)
+	}
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -86,20 +131,20 @@ func TestServeStopsWhenContextIsCanceled(t *testing.T) {
 	}
 }
 
-func writeConfig(t *testing.T) string {
+func writeConfig(t *testing.T) (string, string) {
 	t.Helper()
+	dir := t.TempDir()
 	content := []byte(`listen_addr: "127.0.0.1:0"
 auth_token: "secret"
 bot_url: "http://127.0.0.1:9/bot"
 bot_bearer_token: "bot-secret"
 max_body_bytes: 1024
-task_ttl_seconds: 10
+db_path: "` + filepath.Join(dir, "chat-bridge.db") + `"
 forward_timeout_seconds: 5
-cleanup_interval_seconds: 30
 `)
-	path := filepath.Join(t.TempDir(), "config.yaml")
+	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return path
+	return path, filepath.Join(dir, "chat-bridge.db")
 }

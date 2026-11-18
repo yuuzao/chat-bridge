@@ -49,7 +49,15 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	if err != nil {
 		return err
 	}
-	store := taskstore.New()
+	store, err := taskstore.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			logger.Error("close task store", "error", closeErr.Error())
+		}
+	}()
 	fwd, err := forward.New(cfg.BotURL, cfg.BotBearerToken, cfg.ForwardTimeout, cfg.MaxBodyBytes, logger)
 	if err != nil {
 		return err
@@ -74,17 +82,10 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 		"bot_host", botURL.Host,
 		"bot_path", botURL.EscapedPath(),
 		"max_body_bytes", cfg.MaxBodyBytes,
-		"task_ttl", cfg.TaskTTL.String(),
+		"db_path", cfg.DBPath,
 		"forward_timeout", cfg.ForwardTimeout.String(),
-		"cleanup_interval", cfg.CleanupInterval.String(),
 		"git_commit", getenv("GIT_COMMIT"),
 	)
-	if err := taskstore.StartSweep(ctx, store, cfg.TaskTTL, cfg.CleanupInterval, logger); err != nil {
-		if closeErr := ln.Close(); closeErr != nil {
-			logger.Error("close listener", "error", closeErr.Error())
-		}
-		return err
-	}
 	return serve(ctx, ln, api.Handler(), logger)
 }
 

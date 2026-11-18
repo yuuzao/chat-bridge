@@ -1,17 +1,22 @@
-// Package taskstore 在进程内存中保存任务，并在状态变化时唤醒等待方。
+// Package taskstore 把任务持久化到 SQLite。任务不会因为被读取或下载而删除，进程重启后仍可读取。
 package taskstore
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
-	"sort"
-	"sync"
+	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
-// Status 是任务在内存中的状态。
+// Status 是任务在数据库中的状态。
 type Status string
 
 const (
@@ -24,7 +29,7 @@ const (
 )
 
 var (
-	// ErrNotFound 表示任务不在内存中。
+	// ErrNotFound 表示任务不在数据库中。
 	ErrNotFound = errors.New("task not found")
 	// ErrNotPending 表示任务已经离开 PENDING，不能再次写入结果。
 	ErrNotPending = errors.New("task is not pending")
@@ -41,17 +46,18 @@ func ValidID(id string) bool {
 
 // View 是任务的可读快照，不包含文件字节。
 type View struct {
-	ID       string
-	Status   Status
-	Content  string
-	Failure  string
-	HasFile  bool
-	FileName string
-	FileMIME string
-	Done     <-chan struct{}
+	ID        string
+	Status    Status
+	Content   string
+	Failure   string
+	HasFile   bool
+	FileName  string
+	FileMIME  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
-// File 是可写回客户端的文件内容。Bytes 与内存中的切片共享底层数组，调用方不得修改。
+// File 是可写回客户端的文件内容。
 type File struct {
 	Name  string
 	MIME  string
@@ -67,191 +73,256 @@ type Result struct {
 	FileBytes []byte
 }
 
-type task struct {
-	id        string
-	status    Status
-	content   string
-	failure   string
-	hasFile   bool
-	fileName  string
-	fileMIME  string
-	fileBytes []byte
-	done      chan struct{}
-	closeOnce sync.Once
-	createdAt time.Time
-}
-
-// Store 是单进程内的任务表。
+// Store 是 SQLite 中的任务表。
 type Store struct {
-	mu    sync.RWMutex
-	tasks map[string]*task
+	db *sql.DB
 }
 
-// New 返回空任务表。
-func New() *Store {
-	return &Store{tasks: make(map[string]*task)}
+const schema = `
+CREATE TABLE IF NOT EXISTS tasks (
+	request_id TEXT PRIMARY KEY,
+	status     TEXT NOT NULL,
+	content    TEXT NOT NULL DEFAULT '',
+	error      TEXT NOT NULL DEFAULT '',
+	has_file   INTEGER NOT NULL DEFAULT 0,
+	file_name  TEXT NOT NULL DEFAULT '',
+	file_mime  TEXT NOT NULL DEFAULT '',
+	file_bytes BLOB,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+)`
+
+// 连接池上限。写入由 SQLite 串行化，busy_timeout 负责等待，避免并发下直接返回 SQLITE_BUSY。
+const (
+	maxOpenConns = 8
+	maxIdleConns = 8
+	busyTimeout  = "5000"
+)
+
+// Open 打开 path 指向的 SQLite 数据库，必要时创建父目录，并确保任务表存在。
+// path 不能为空，也不能包含 ?（会被驱动当作 DSN 参数分隔符）。
+func Open(path string) (*Store, error) {
+	if path == "" {
+		return nil, errors.New("db path is required")
+	}
+	if strings.ContainsRune(path, '?') {
+		return nil, errors.New("db path must not contain '?'")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, fmt.Errorf("create db directory: %w", err)
+	}
+	db, err := sql.Open("sqlite", dataSourceName(path))
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxLifetime(0)
+	store := &Store{db: db}
+	if err := store.init(); err != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close sqlite: %w", closeErr))
+		}
+		return nil, err
+	}
+	return store, nil
 }
 
-// Create 生成任务 ID，并以 PENDING 放入任务表。
+// dataSourceName 组装 DSN。PRAGMA 由驱动在每条新连接上执行，因此连接池里的连接都带同样的设置。
+// temp_store=MEMORY 让临时文件不进磁盘，scratch 镜像里没有 /tmp。
+func dataSourceName(path string) string {
+	params := []string{
+		"_pragma=busy_timeout(" + busyTimeout + ")",
+		"_pragma=temp_store(MEMORY)",
+		"_pragma=journal_mode(WAL)",
+		"_pragma=synchronous(NORMAL)",
+	}
+	return path + "?" + strings.Join(params, "&")
+}
+
+// init 建立连接并确保表结构存在。
+func (s *Store) init() error {
+	if err := s.db.PingContext(context.Background()); err != nil {
+		return fmt.Errorf("open sqlite: %w", err)
+	}
+	if _, err := s.db.Exec(schema); err != nil {
+		return fmt.Errorf("create tasks table: %w", err)
+	}
+	return nil
+}
+
+// Close 关闭数据库连接。
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return errors.New("store is required")
+	}
+	return s.db.Close()
+}
+
+// Create 生成任务 ID，并以 PENDING 写入数据库。
 func (s *Store) Create() (View, error) {
-	if s == nil {
+	if s == nil || s.db == nil {
 		return View{}, errors.New("store is required")
 	}
 	id, err := newID()
 	if err != nil {
 		return View{}, err
 	}
-	item := &task{
-		id:        id,
-		status:    StatusPending,
-		done:      make(chan struct{}),
-		createdAt: time.Now(),
+	now := time.Now()
+	_, err = s.db.Exec(
+		`INSERT INTO tasks (request_id, status, content, error, has_file, file_name, file_mime, file_bytes, created_at, updated_at)
+		 VALUES (?, ?, '', '', 0, '', '', NULL, ?, ?)`,
+		id, string(StatusPending), now.UnixNano(), now.UnixNano(),
+	)
+	if err != nil {
+		return View{}, fmt.Errorf("insert task: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tasks[id] = item
-	return item.view(), nil
+	return s.View(id)
 }
 
 // View 返回任务快照。
 func (s *Store) View(id string) (View, error) {
-	if s == nil {
+	if s == nil || s.db == nil {
 		return View{}, errors.New("store is required")
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	item, ok := s.tasks[id]
-	if !ok {
-		return View{}, ErrNotFound
-	}
-	return item.view(), nil
+	row := s.db.QueryRow(
+		`SELECT request_id, status, content, error, has_file, file_name, file_mime, created_at, updated_at
+		 FROM tasks WHERE request_id = ?`, id,
+	)
+	return scanView(row)
 }
 
 // File 返回已完成且带文件的任务内容。
 func (s *Store) File(id string) (File, error) {
-	if s == nil {
+	if s == nil || s.db == nil {
 		return File{}, errors.New("store is required")
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	item, ok := s.tasks[id]
-	if !ok {
+	var status string
+	var hasFile int
+	var file File
+	err := s.db.QueryRow(
+		`SELECT status, has_file, file_name, file_mime, file_bytes FROM tasks WHERE request_id = ?`, id,
+	).Scan(&status, &hasFile, &file.Name, &file.MIME, &file.Bytes)
+	if errors.Is(err, sql.ErrNoRows) {
 		return File{}, ErrNotFound
 	}
-	if item.status != StatusDone || !item.hasFile {
+	if err != nil {
+		return File{}, fmt.Errorf("query task file: %w", err)
+	}
+	if Status(status) != StatusDone || hasFile != 1 {
 		return File{}, ErrFileNotAvailable
 	}
-	return File{Name: item.fileName, MIME: item.fileMIME, Bytes: item.fileBytes}, nil
+	if file.Name == "" || file.MIME == "" || file.Bytes == nil {
+		return File{}, fmt.Errorf("task %s is DONE with has_file but its file is incomplete", id)
+	}
+	return file, nil
 }
 
-// Complete 把 PENDING 任务写成 DONE，并关闭等待通道。
-// 任务已不在 PENDING 时返回当前快照和 ErrNotPending，不修改任务，也不再次关闭通道。
+// Complete 用一条带 status = 'PENDING' 条件的 UPDATE 把任务写成 DONE。
+// 任务已不在 PENDING 时返回当前快照和 ErrNotPending，不覆写已有结果。
 func (s *Store) Complete(id string, result Result) (View, error) {
-	if s == nil {
+	if s == nil || s.db == nil {
 		return View{}, errors.New("store is required")
 	}
 	if err := validateResult(result); err != nil {
 		return View{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	item, ok := s.tasks[id]
-	if !ok {
-		return View{}, ErrNotFound
+	var fileBytes any
+	if result.HasFile {
+		fileBytes = result.FileBytes
 	}
-	if item.status != StatusPending {
-		return item.view(), ErrNotPending
+	done, err := s.updatePending(id, `status = ?, content = ?, error = '', has_file = ?, file_name = ?, file_mime = ?, file_bytes = ?`,
+		string(StatusDone), result.Content, boolToInt(result.HasFile), result.FileName, result.FileMIME, fileBytes)
+	if err != nil {
+		return View{}, err
 	}
-	item.status = StatusDone
-	item.content = result.Content
-	item.hasFile = result.HasFile
-	item.fileName = result.FileName
-	item.fileMIME = result.FileMIME
-	item.fileBytes = result.FileBytes
-	item.closeDone()
-	return item.view(), nil
+	if done {
+		return s.View(id)
+	}
+	view, err := s.View(id)
+	if err != nil {
+		return View{}, err
+	}
+	return view, ErrNotPending
 }
 
-// Fail 把 PENDING 任务写成 FAILED，并关闭等待通道。reason 会原样保存。
+// Fail 把 PENDING 任务写成 FAILED。reason 会原样保存。
 func (s *Store) Fail(id string, reason string) error {
-	if s == nil {
+	if s == nil || s.db == nil {
 		return errors.New("store is required")
 	}
 	if reason == "" {
 		return errors.New("failure reason is required")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	item, ok := s.tasks[id]
-	if !ok {
-		return ErrNotFound
+	done, err := s.updatePending(id, `status = ?, error = ?, has_file = 0, file_name = '', file_mime = '', file_bytes = NULL`,
+		string(StatusFailed), reason)
+	if err != nil {
+		return err
 	}
-	if item.status != StatusPending {
-		return ErrNotPending
+	if done {
+		return nil
 	}
-	item.status = StatusFailed
-	item.failure = reason
-	item.closeDone()
-	return nil
+	if _, err := s.View(id); err != nil {
+		return err
+	}
+	return ErrNotPending
 }
 
-// Delete 从任务表删除任务。若通道尚未关闭，会先关闭它以唤醒等待方。
-func (s *Store) Delete(id string) error {
-	if s == nil {
-		return errors.New("store is required")
+// updatePending 以 status = 'PENDING' 为条件更新任务，返回是否命中。
+// 未命中时调用方需要再查一次任务是否存在，区分 ErrNotFound 与 ErrNotPending。
+func (s *Store) updatePending(id, assignments string, args ...any) (bool, error) {
+	now := time.Now()
+	args = append(args, now.UnixNano(), id, string(StatusPending))
+	res, err := s.db.Exec(
+		`UPDATE tasks SET `+assignments+`, updated_at = ? WHERE request_id = ? AND status = ?`,
+		args...,
+	)
+	if err != nil {
+		return false, fmt.Errorf("update task: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	item, ok := s.tasks[id]
-	if !ok {
-		return ErrNotFound
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("update task rows: %w", err)
 	}
-	item.closeDone()
-	item.fileBytes = nil
-	delete(s.tasks, id)
-	return nil
+	return rows == 1, nil
 }
 
-// Sweep 删除创建时间距 now 超过 ttl 的任务，并返回被删除的 ID。
-func (s *Store) Sweep(now time.Time, ttl time.Duration) ([]string, error) {
-	if s == nil {
-		return nil, errors.New("store is required")
-	}
-	if ttl <= 0 {
-		return nil, errors.New("ttl must be positive")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ids := make([]string, 0)
-	for id, item := range s.tasks {
-		if now.Sub(item.createdAt) > ttl {
-			item.closeDone()
-			item.fileBytes = nil
-			delete(s.tasks, id)
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	return ids, nil
+type rowScanner interface {
+	Scan(dest ...any) error
 }
 
-func (item *task) view() View {
-	return View{
-		ID:       item.id,
-		Status:   item.status,
-		Content:  item.content,
-		Failure:  item.failure,
-		HasFile:  item.hasFile,
-		FileName: item.fileName,
-		FileMIME: item.fileMIME,
-		Done:     item.done,
+func scanView(row rowScanner) (View, error) {
+	var view View
+	var status string
+	var hasFile int
+	var createdAt, updatedAt int64
+	err := row.Scan(
+		&view.ID, &status, &view.Content, &view.Failure, &hasFile,
+		&view.FileName, &view.FileMIME, &createdAt, &updatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return View{}, ErrNotFound
 	}
+	if err != nil {
+		return View{}, fmt.Errorf("query task: %w", err)
+	}
+	switch Status(status) {
+	case StatusPending, StatusDone, StatusFailed:
+		view.Status = Status(status)
+	default:
+		return View{}, fmt.Errorf("task %s has unknown status %q", view.ID, status)
+	}
+	view.HasFile = hasFile == 1
+	view.CreatedAt = time.Unix(0, createdAt)
+	view.UpdatedAt = time.Unix(0, updatedAt)
+	return view, nil
 }
 
-func (item *task) closeDone() {
-	item.closeOnce.Do(func() {
-		close(item.done)
-	})
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func validateResult(result Result) error {

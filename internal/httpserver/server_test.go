@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -46,30 +47,27 @@ func TestJSONTaskAndTextWebhook(t *testing.T) {
 		t.Fatalf("sent = %+v", sent)
 	}
 
-	waitResult := make(chan httpResult, 1)
-	go func() {
-		resp, err := h.get("/api/tasks/" + created.RequestID + "?wait=5")
-		waitResult <- httpResult{resp: resp, err: err}
-	}()
-	time.Sleep(150 * time.Millisecond)
+	pending := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+	if pending.StatusCode != http.StatusOK {
+		t.Fatalf("pending status = %d", pending.StatusCode)
+	}
+	if body := decodeJSON[statusResponse](t, pending); body.Status != taskstore.StatusPending {
+		t.Fatalf("pending = %+v", body)
+	}
+
 	hook := h.do(t, h.jsonReq(t, http.MethodPost, "/api/webhook", `{"request_id":"`+created.RequestID+`","content":"reply-secret-text"}`, h.token))
 	if hook.StatusCode != http.StatusOK {
 		t.Fatalf("webhook = %d %s", hook.StatusCode, readRaw(t, hook))
 	}
-	waited := <-waitResult
-	if waited.err != nil {
-		t.Fatal(waited.err)
+	got := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+	status := decodeJSON[statusResponse](t, got)
+	if status.Status != taskstore.StatusDone || status.Content != "reply-secret-text" || status.HasFile {
+		t.Fatalf("status = %+v", status)
 	}
-	t.Cleanup(func() {
-		_ = waited.resp.Body.Close()
-	})
-	got := decodeJSON[statusResponse](t, waited.resp)
-	if got.Status != taskstore.StatusDone || got.Content != "reply-secret-text" || got.HasFile {
-		t.Fatalf("status = %+v", got)
-	}
-	missing := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
-	if missing.StatusCode != http.StatusNotFound {
-		t.Fatalf("second status = %d", missing.StatusCode)
+	again := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+	againStatus := decodeJSON[statusResponse](t, again)
+	if again.StatusCode != http.StatusOK || againStatus.Content != "reply-secret-text" {
+		t.Fatalf("task did not survive a second read: %d %+v", again.StatusCode, againStatus)
 	}
 	if strings.Contains(h.logs.String(), "reply-secret-text") || strings.Contains(h.logs.String(), h.token) {
 		t.Fatalf("log leaked data: %s", h.logs.String())
@@ -79,7 +77,7 @@ func TestJSONTaskAndTextWebhook(t *testing.T) {
 	}
 }
 
-func TestFileRoundTrip(t *testing.T) {
+func TestFileRoundTripAndRepeatDownload(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, harnessOptions{})
 	contentType, body := multipartBody(t, map[string]string{"content": "draw"}, "笔记.txt", "image/png", []byte{0, 1, 255})
@@ -109,6 +107,9 @@ func TestFileRoundTrip(t *testing.T) {
 	if fileResp.StatusCode != http.StatusConflict {
 		t.Fatalf("early file = %d", fileResp.StatusCode)
 	}
+	if body := decodeJSON[statusResponse](t, fileResp); body.Error != "file not ready" || body.Status != taskstore.StatusPending {
+		t.Fatalf("early file body = %+v", body)
+	}
 
 	hookType, hookBody := multipartBody(t, map[string]string{
 		"request_id": created.RequestID,
@@ -128,57 +129,51 @@ func TestFileRoundTrip(t *testing.T) {
 	if again.StatusCode != http.StatusOK || againMeta.FileName != "笔记.txt" {
 		t.Fatalf("status removed file metadata early: %d %+v", again.StatusCode, againMeta)
 	}
-	download := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID+"/file", "", h.token))
-	if download.StatusCode != http.StatusOK {
-		t.Fatalf("download = %d %s", download.StatusCode, readRaw(t, download))
+	for i := 0; i < 3; i++ {
+		download := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID+"/file", "", h.token))
+		if download.StatusCode != http.StatusOK {
+			t.Fatalf("download %d = %d %s", i, download.StatusCode, readRaw(t, download))
+		}
+		if !bytes.Equal(readRaw(t, download), []byte{0, 1, 255}) {
+			t.Fatal("file bytes mismatch")
+		}
+		_, params, err := mime.ParseMediaType(download.Header.Get("Content-Disposition"))
+		if err != nil || params["filename"] != "笔记.txt" {
+			t.Fatalf("disposition = %q err = %v", download.Header.Get("Content-Disposition"), err)
+		}
+		if download.Header.Get("Content-Type") != "image/png" {
+			t.Fatal(download.Header.Get("Content-Type"))
+		}
 	}
-	if !bytes.Equal(readRaw(t, download), []byte{0, 1, 255}) {
-		t.Fatal("file bytes mismatch")
-	}
-	_, params, err := mime.ParseMediaType(download.Header.Get("Content-Disposition"))
-	if err != nil || params["filename"] != "笔记.txt" {
-		t.Fatalf("disposition = %q err = %v", download.Header.Get("Content-Disposition"), err)
-	}
-	if download.Header.Get("Content-Type") != "image/png" {
-		t.Fatal(download.Header.Get("Content-Type"))
-	}
-	gone := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID+"/file", "", h.token))
-	if gone.StatusCode != http.StatusNotFound {
-		t.Fatalf("second download = %d", gone.StatusCode)
+	after := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+	afterMeta := decodeJSON[statusResponse](t, after)
+	if after.StatusCode != http.StatusOK || afterMeta.FileName != "笔记.txt" {
+		t.Fatalf("download removed task: %d %+v", after.StatusCode, afterMeta)
 	}
 	if strings.Contains(h.logs.String(), "reply-secret-text") || strings.Contains(h.logs.String(), h.token) {
 		t.Fatalf("log leaked data: %s", h.logs.String())
 	}
 }
 
-func TestFileWait(t *testing.T) {
+func TestWaitParameterIsRejected(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, harnessOptions{})
-	created := h.create(t, `{"content":"draw"}`)
+	created := h.create(t, `{"content":"hi"}`)
 	h.awaitBot(t)
-	waitResult := make(chan httpResult, 1)
-	go func() {
-		resp, err := h.get("/api/tasks/" + created.RequestID + "/file?wait=5")
-		waitResult <- httpResult{resp: resp, err: err}
-	}()
-	time.Sleep(150 * time.Millisecond)
-	hookType, hookBody := multipartBody(t, map[string]string{
-		"request_id": created.RequestID,
-		"content":    "ok",
-	}, "a.txt", "text/plain", []byte("xyz"))
-	hook := h.do(t, h.rawReq(t, http.MethodPost, "/api/webhook", hookType, hookBody, h.token))
-	if hook.StatusCode != http.StatusOK {
-		t.Fatal(readRaw(t, hook))
-	}
-	waited := <-waitResult
-	if waited.err != nil {
-		t.Fatal(waited.err)
-	}
-	t.Cleanup(func() {
-		_ = waited.resp.Body.Close()
-	})
-	if waited.resp.StatusCode != http.StatusOK || string(readRaw(t, waited.resp)) != "xyz" {
-		t.Fatalf("wait file = %d", waited.resp.StatusCode)
+	for _, path := range []string{
+		"/api/tasks/" + created.RequestID + "?wait=5",
+		"/api/tasks/" + created.RequestID + "/file?wait=5",
+		"/api/tasks/" + created.RequestID + "?wait=",
+	} {
+		start := time.Now()
+		resp := h.do(t, h.jsonReq(t, http.MethodGet, path, "", h.token))
+		body := decodeJSON[errorResponse](t, resp)
+		if resp.StatusCode != http.StatusBadRequest || body.Error != "wait is not supported" {
+			t.Fatalf("%s = %d %+v", path, resp.StatusCode, body)
+		}
+		if time.Since(start) > time.Second {
+			t.Fatalf("%s did not return immediately", path)
+		}
 	}
 }
 
@@ -196,30 +191,31 @@ func TestTextResultFileEndpointKeepsTask(t *testing.T) {
 	if fileResp.StatusCode != http.StatusNotFound || fileBody.Error != "task has no file" || fileBody.Content != "only text" {
 		t.Fatalf("file = %d %+v", fileResp.StatusCode, fileBody)
 	}
-	statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
-	statusBody := decodeJSON[statusResponse](t, statusResp)
-	if statusResp.StatusCode != http.StatusOK || statusBody.Content != "only text" {
-		t.Fatalf("status = %d %+v", statusResp.StatusCode, statusBody)
-	}
-	gone := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
-	if gone.StatusCode != http.StatusNotFound {
-		t.Fatalf("second status = %d", gone.StatusCode)
+	for i := 0; i < 2; i++ {
+		statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+		statusBody := decodeJSON[statusResponse](t, statusResp)
+		if statusResp.StatusCode != http.StatusOK || statusBody.Content != "only text" {
+			t.Fatalf("status %d = %d %+v", i, statusResp.StatusCode, statusBody)
+		}
 	}
 }
 
-func TestForwardFailureIsReadableOnce(t *testing.T) {
+func TestForwardFailureIsReadableRepeatedly(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, harnessOptions{botStatus: http.StatusInternalServerError})
 	created := h.create(t, `{"content":"hi"}`)
 	h.awaitBot(t)
-	statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID+"?wait=2", "", h.token))
-	body := decodeJSON[statusResponse](t, statusResp)
-	if statusResp.StatusCode != http.StatusOK || body.Status != taskstore.StatusFailed || !strings.Contains(body.Error, "HTTP 500") {
-		t.Fatalf("status = %d %+v", statusResp.StatusCode, body)
+	for i := 0; i < 2; i++ {
+		statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+		body := decodeJSON[statusResponse](t, statusResp)
+		if statusResp.StatusCode != http.StatusOK || body.Status != taskstore.StatusFailed || !strings.Contains(body.Error, "HTTP 500") {
+			t.Fatalf("status %d = %d %+v", i, statusResp.StatusCode, body)
+		}
 	}
-	gone := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
-	if gone.StatusCode != http.StatusNotFound {
-		t.Fatalf("second status = %d", gone.StatusCode)
+	fileResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID+"/file", "", h.token))
+	fileBody := decodeJSON[statusResponse](t, fileResp)
+	if fileResp.StatusCode != http.StatusConflict || fileBody.Status != taskstore.StatusFailed {
+		t.Fatalf("failed file = %d %+v", fileResp.StatusCode, fileBody)
 	}
 }
 
@@ -245,21 +241,41 @@ func TestDuplicateWebhookKeepsFile(t *testing.T) {
 	}
 }
 
-func TestWaitTimeoutKeepsPending(t *testing.T) {
+func TestConcurrentStatusPollsDuringWebhook(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, harnessOptions{})
 	created := h.create(t, `{"content":"hi"}`)
 	h.awaitBot(t)
-	start := time.Now()
-	statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID+"?wait=1", "", h.token))
-	body := decodeJSON[statusResponse](t, statusResp)
-	if time.Since(start) < 900*time.Millisecond || body.Status != taskstore.StatusPending {
-		t.Fatalf("elapsed = %s body = %+v", time.Since(start), body)
+	var wg sync.WaitGroup
+	statuses := make(chan int, 32)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := h.get("/api/tasks/" + created.RequestID)
+			if err != nil {
+				t.Errorf("poll: %v", err)
+				return
+			}
+			statuses <- resp.StatusCode
+			_ = resp.Body.Close()
+		}()
 	}
-	again := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
-	againBody := decodeJSON[statusResponse](t, again)
-	if again.StatusCode != http.StatusOK || againBody.Status != taskstore.StatusPending {
-		t.Fatalf("again = %d %+v", again.StatusCode, againBody)
+	hook := h.do(t, h.jsonReq(t, http.MethodPost, "/api/webhook", `{"request_id":"`+created.RequestID+`","content":"done"}`, h.token))
+	if hook.StatusCode != http.StatusOK {
+		t.Fatalf("webhook = %d", hook.StatusCode)
+	}
+	wg.Wait()
+	close(statuses)
+	for code := range statuses {
+		if code != http.StatusOK {
+			t.Fatalf("poll status = %d", code)
+		}
+	}
+	statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+	body := decodeJSON[statusResponse](t, statusResp)
+	if body.Status != taskstore.StatusDone || body.Content != "done" {
+		t.Fatalf("final = %+v", body)
 	}
 }
 
@@ -280,15 +296,17 @@ func TestRejectedRequestsDoNotForward(t *testing.T) {
 		{name: "missing content", path: "/api/tasks", body: `{"extra":false}`, media: "application/json", token: "test-token", wantStatus: http.StatusBadRequest, wantError: "unknown field"},
 		{name: "duplicate content", path: "/api/tasks", body: `{"content":"a","content":"b"}`, media: "application/json", token: "test-token", wantStatus: http.StatusBadRequest, wantError: "duplicate field"},
 		{name: "text body", path: "/api/tasks", body: "hi", media: "text/plain", token: "test-token", wantStatus: http.StatusUnsupportedMediaType, wantError: "unsupported content type"},
-		{name: "bad wait", path: "/api/tasks/11111111-1111-4111-8111-111111111111?wait=0", media: "", token: "test-token", wantStatus: http.StatusBadRequest, wantError: "invalid wait"},
+		{name: "deprecated wait", path: "/api/tasks/11111111-1111-4111-8111-111111111111?wait=0", media: "", token: "test-token", wantStatus: http.StatusBadRequest, wantError: "wait is not supported"},
 		{name: "unknown task", path: "/api/webhook", body: `{"request_id":"11111111-1111-4111-8111-111111111111","content":"x"}`, media: "application/json", token: "test-token", wantStatus: http.StatusNotFound, wantError: "task not found"},
+		{name: "unknown task status", path: "/api/tasks/11111111-1111-4111-8111-111111111111", media: "", token: "test-token", wantStatus: http.StatusNotFound, wantError: "task not found"},
+		{name: "unknown task file", path: "/api/tasks/11111111-1111-4111-8111-111111111111/file", media: "", token: "test-token", wantStatus: http.StatusNotFound, wantError: "task not found"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			h := newHarness(t, harnessOptions{})
 			method := http.MethodPost
-			if strings.Contains(test.path, "/api/tasks/") {
+			if strings.HasPrefix(test.path, "/api/tasks/") {
 				method = http.MethodGet
 			}
 			req := h.rawReq(t, method, test.path, test.media, []byte(test.body), test.token)
@@ -397,8 +415,15 @@ func TestForwardTimeout(t *testing.T) {
 		},
 	})
 	created := h.create(t, `{"content":"hi"}`)
-	statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID+"?wait=2", "", h.token))
-	body := decodeJSON[statusResponse](t, statusResp)
+	var body statusResponse
+	for i := 0; i < 100; i++ {
+		statusResp := h.do(t, h.jsonReq(t, http.MethodGet, "/api/tasks/"+created.RequestID, "", h.token))
+		body = decodeJSON[statusResponse](t, statusResp)
+		if body.Status == taskstore.StatusFailed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if body.Status != taskstore.StatusFailed || !strings.Contains(body.Error, "bot request failed") {
 		t.Fatalf("status = %+v", body)
 	}
@@ -414,11 +439,6 @@ type harnessOptions struct {
 	bot            http.HandlerFunc
 }
 
-type httpResult struct {
-	resp *http.Response
-	err  error
-}
-
 type capture struct {
 	token       string
 	contentType string
@@ -432,6 +452,7 @@ type harness struct {
 	captured chan capture
 	api      *httptest.Server
 	client   *http.Client
+	store    *taskstore.Store
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -470,21 +491,30 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}))
 	t.Cleanup(bot.Close)
 	logger := slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	store, err := taskstore.Open(filepath.Join(t.TempDir(), "chat-bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	h.store = store
 	cfg := config.Config{
-		ListenAddr:      "127.0.0.1:0",
-		AuthToken:       h.token,
-		BotURL:          bot.URL,
-		BotBearerToken:  h.bearer,
-		MaxBodyBytes:    opts.maxBody,
-		TaskTTL:         time.Minute,
-		ForwardTimeout:  opts.forwardTimeout,
-		CleanupInterval: time.Minute,
+		ListenAddr:     "127.0.0.1:0",
+		AuthToken:      h.token,
+		BotURL:         bot.URL,
+		BotBearerToken: h.bearer,
+		MaxBodyBytes:   opts.maxBody,
+		DBPath:         filepath.Join(t.TempDir(), "unused.db"),
+		ForwardTimeout: opts.forwardTimeout,
 	}
 	fwd, err := forward.New(cfg.BotURL, cfg.BotBearerToken, cfg.ForwardTimeout, cfg.MaxBodyBytes, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
-	api, err := New(cfg, taskstore.New(), fwd, logger)
+	api, err := New(cfg, store, fwd, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

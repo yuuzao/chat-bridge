@@ -17,7 +17,7 @@ func TestLoadAcceptsCompleteFile(t *testing.T) {
 	if cfg.ListenAddr != "127.0.0.1:8080" || cfg.AuthToken != "secret" || cfg.BotURL != "http://127.0.0.1:9/bot?x=1" || cfg.BotBearerToken != "bot-secret" {
 		t.Fatalf("config = %+v", cfg)
 	}
-	if cfg.MaxBodyBytes != 1024 || cfg.TaskTTL != 10*time.Second || cfg.ForwardTimeout != 5*time.Second || cfg.CleanupInterval != 2*time.Second {
+	if cfg.MaxBodyBytes != 1024 || cfg.DBPath != "/data/chat-bridge.db" || cfg.ForwardTimeout != 5*time.Second {
 		t.Fatalf("numeric config = %+v", cfg)
 	}
 }
@@ -34,7 +34,11 @@ func TestLoadRejectsInvalidFiles(t *testing.T) {
 		{name: "empty bearer", yaml: strings.Replace(validYAML(), "bot_bearer_token: \"bot-secret\"", "bot_bearer_token: \"\"", 1), wantErr: "bot_bearer_token"},
 		{name: "bearer whitespace", yaml: strings.Replace(validYAML(), "bot_bearer_token: \"bot-secret\"", "bot_bearer_token: \"bot secret\"", 1), wantErr: "bot_bearer_token"},
 		{name: "zero body", yaml: strings.Replace(validYAML(), "max_body_bytes: 1024", "max_body_bytes: 0", 1), wantErr: "max_body_bytes"},
-		{name: "negative ttl", yaml: strings.Replace(validYAML(), "task_ttl_seconds: 10", "task_ttl_seconds: -1", 1), wantErr: "task_ttl_seconds"},
+		{name: "missing db path", yaml: strings.Replace(validYAML(), "db_path: \"/data/chat-bridge.db\"\n", "", 1), wantErr: "db_path"},
+		{name: "empty db path", yaml: strings.Replace(validYAML(), "db_path: \"/data/chat-bridge.db\"", "db_path: \"\"", 1), wantErr: "db_path"},
+		{name: "removed task ttl", yaml: validYAML() + "task_ttl_seconds: 10\n", wantErr: "task_ttl_seconds"},
+		{name: "removed cleanup interval", yaml: validYAML() + "cleanup_interval_seconds: 10\n", wantErr: "cleanup_interval_seconds"},
+		{name: "zero forward timeout", yaml: strings.Replace(validYAML(), "forward_timeout_seconds: 5", "forward_timeout_seconds: 0", 1), wantErr: "forward_timeout_seconds"},
 		{name: "unknown field", yaml: validYAML() + "extra: 1\n", wantErr: "extra"},
 		{name: "duplicate key", yaml: "listen_addr: \"127.0.0.1:1\"\n" + validYAML(), wantErr: "duplicate"},
 		{name: "userinfo", yaml: strings.Replace(validYAML(), "http://127.0.0.1:9/bot?x=1", "http://user:pass@127.0.0.1:9/bot", 1), wantErr: "user info"},
@@ -67,9 +71,8 @@ auth_token: "secret"
 bot_url: "http://127.0.0.1:9/bot?x=1"
 bot_bearer_token: "bot-secret"
 max_body_bytes: 1024
-task_ttl_seconds: 10
+db_path: "/data/chat-bridge.db"
 forward_timeout_seconds: 5
-cleanup_interval_seconds: 2
 `
 }
 

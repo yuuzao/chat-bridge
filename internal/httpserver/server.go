@@ -1,4 +1,5 @@
 // Package httpserver 提供任务创建、回调、状态查询和文件下载四个接口。
+// 查询与下载都是即时的：直接读 SQLite，不做长等待，也不删除任务。
 package httpserver
 
 import (
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 
 	"chat_bridge/internal/config"
@@ -65,10 +67,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := writeJSON(w, http.StatusAccepted, createResponse{RequestID: view.ID, Status: view.Status}); err != nil {
-		if delErr := s.store.Delete(view.ID); delErr != nil {
-			s.log.Error("remove task after create write failure", "request_id", view.ID, "error", delErr.Error())
-		}
 		s.log.Error("write create response", "request_id", view.ID, "error", err.Error())
+		if failErr := s.store.Fail(view.ID, "write create response: "+err.Error()); failErr != nil {
+			s.log.Error("mark task failed after create write failure", "request_id", view.ID, "error", failErr.Error())
+		}
 		return
 	}
 	uploadFile := in.file != nil
@@ -159,14 +161,13 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		s.writeMissing(w, id)
 		return
 	}
-	wait, err := parseWait(r.URL.Query())
-	if err != nil {
+	if err := rejectWait(r.URL.Query()); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	view, err := s.waitView(r.Context(), id, wait)
+	view, err := s.store.View(id)
 	if err != nil {
-		s.writeWaitError(w, r, id, err)
+		s.writeStoreError(w, r, id, err)
 		return
 	}
 	s.finishStatus(w, view)
@@ -182,40 +183,48 @@ func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 		s.writeMissing(w, id)
 		return
 	}
-	wait, err := parseWait(r.URL.Query())
-	if err != nil {
+	if err := rejectWait(r.URL.Query()); err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	view, err := s.waitView(r.Context(), id, wait)
-	if err != nil {
-		s.writeWaitError(w, r, id, err)
-		return
-	}
-	if view.Status != taskstore.StatusDone || !view.HasFile {
+	// 回调可能刚好落在“取文件”和“查状态”之间，此时再取一次文件，避免把可下载的任务报成不可用。
+	for attempt := 0; ; attempt++ {
+		file, err := s.store.File(id)
+		if err == nil {
+			if err := writeFile(w, file); err != nil {
+				s.log.Error("write file response", "request_id", id, "error", err.Error())
+				return
+			}
+			s.log.Info("file served", "request_id", id, "file_bytes", len(file.Bytes), "file_name", file.Name)
+			return
+		}
+		if errors.Is(err, taskstore.ErrNotFound) {
+			s.writeMissing(w, id)
+			return
+		}
+		if !errors.Is(err, taskstore.ErrFileNotAvailable) {
+			s.writeError(w, r, err)
+			return
+		}
+		view, viewErr := s.store.View(id)
+		if viewErr != nil {
+			s.writeStoreError(w, r, id, viewErr)
+			return
+		}
+		if attempt == 0 && view.Status == taskstore.StatusDone && view.HasFile {
+			continue
+		}
 		s.writeFileUnavailable(w, view)
 		return
 	}
-	file, err := s.store.File(id)
-	if errors.Is(err, taskstore.ErrNotFound) {
-		s.writeMissing(w, id)
-		return
+}
+
+// rejectWait 拒绝已废弃的长轮询参数。查询和下载都是即时的，服务端不再阻塞等待结果。
+func rejectWait(query url.Values) error {
+	if _, ok := query["wait"]; ok {
+		return statusErr(http.StatusBadRequest, "wait is not supported")
 	}
-	if err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	if err := writeFile(w, file); err != nil {
-		s.log.Error("write file response", "request_id", id, "error", err.Error())
-		return
-	}
-	if err := s.store.Delete(id); err != nil {
-		if !errors.Is(err, taskstore.ErrNotFound) {
-			s.log.Error("remove task after file", "request_id", id, "error", err.Error())
-		}
-		return
-	}
-	s.log.Info("task removed", "request_id", id, "reason", "file_read", "file_bytes", len(file.Bytes), "file_name", file.Name)
+	return nil
 }
 
 func (s *Server) finishStatus(w http.ResponseWriter, view taskstore.View) {
@@ -223,30 +232,16 @@ func (s *Server) finishStatus(w http.ResponseWriter, view taskstore.View) {
 		s.log.Error("write status response", "request_id", view.ID, "error", err.Error())
 		return
 	}
-	if !shouldRemoveAfterStatus(view) {
-		if view.Status == taskstore.StatusPending {
-			s.log.Debug("task status served", "request_id", view.ID, "status", string(view.Status), "removed", false)
-			return
-		}
-		s.log.Info("task status served", "request_id", view.ID, "status", string(view.Status), "removed", false)
+	if view.Status == taskstore.StatusPending {
+		s.log.Debug("task status served", "request_id", view.ID, "status", string(view.Status))
 		return
 	}
-	if err := s.store.Delete(view.ID); err != nil {
-		if !errors.Is(err, taskstore.ErrNotFound) {
-			s.log.Error("remove task after status", "request_id", view.ID, "error", err.Error())
-		}
-		return
-	}
-	s.log.Info("task removed", "request_id", view.ID, "reason", "status_read", "status", string(view.Status))
+	s.log.Info("task status served", "request_id", view.ID, "status", string(view.Status))
 }
 
-func (s *Server) writeWaitError(w http.ResponseWriter, r *http.Request, id string, err error) {
+func (s *Server) writeStoreError(w http.ResponseWriter, r *http.Request, id string, err error) {
 	if errors.Is(err, taskstore.ErrNotFound) {
 		s.writeMissing(w, id)
-		return
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		s.log.Debug("wait canceled", "request_id", id, "error", err.Error())
 		return
 	}
 	s.writeError(w, r, err)
@@ -277,13 +272,6 @@ func (s *Server) writeFileUnavailable(w http.ResponseWriter, view taskstore.View
 		s.log.Error("unexpected task status", "request_id", view.ID, "status", string(view.Status))
 		s.respond(w, http.StatusInternalServerError, errorResponse{Error: "internal error"})
 	}
-}
-
-func shouldRemoveAfterStatus(view taskstore.View) bool {
-	if view.Status == taskstore.StatusFailed {
-		return true
-	}
-	return view.Status == taskstore.StatusDone && !view.HasFile
 }
 
 func writeFile(w http.ResponseWriter, file taskstore.File) error {
