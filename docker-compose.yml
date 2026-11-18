@@ -9,13 +9,22 @@ services:
       LOG_LEVEL: INFO
       GIT_COMMIT: ${GIT_COMMIT:?GIT_COMMIT is required}
     ports:
-      - "8080:8080"
+      # 默认仅绑定本机回环供 Caddy 等反向代理转发，避免明文 HTTP 暴露到公网。
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config.yaml:/config.yaml:ro
-      # SQLite 数据库目录。必须挂目录而不是单个文件，WAL 日志要在同一目录里创建。
+      # SQLite 数据库持久化目录（需归属 HOST_UID:HOST_GID 可写）。
+      # 必须挂目录而不是单个文件，WAL 日志（-wal / -shm）要在同一目录里创建。
       # config.yaml 里的 db_path 对应 /data/chat-bridge.db。
       - ./data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
     read_only: true
-    restart: "no"
+    # 留足优雅退出窗口，确保重启或重建容器时完成 SQLite WAL checkpoint 落盘。
+    stop_grace_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
